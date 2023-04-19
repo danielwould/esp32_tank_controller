@@ -6,7 +6,7 @@
 // If you are not using a shield,  use a full Adafruit constructor()
 // e.g. Adafruit_TFTLCD tft(LCD_CS, LCD_CD, LCD_WR, LCD_RD, LCD_RESET);
 
-
+#define DEBUG 0
 // *** enable following is for ESP32 ***
 #define LCD_CS 33 // Chip Select ESP32 GPIO33
 #define LCD_RS 15 // LCD_RS = Register Select or LCD_CD = Command/Data
@@ -24,12 +24,19 @@
 #define TELEMETRY      1
 #define IMAGE_PART     2
 
+// Return the minimum of two values a and b
+#define minimum(a,b)     (((a) < (b)) ? (a) : (b))
+
 #include <SPI.h>          // f.k. for Arduino-1.5.2
 #include "WiFi.h"
 #include <esp_now.h>
 #include "Adafruit_GFX.h"// Hardware-specific library
 #include <MCUFRIEND_kbv.h>
 MCUFRIEND_kbv tft;
+
+// #include <TJpg_Decoder.h>
+#include <JPEGDecoder.h>
+
 //#include <Adafruit_TFTLCD.h>
 //Adafruit_TFTLCD tft(LCD_CS, LCD_CD, LCD_WR, LCD_RD, LCD_RESET);
 
@@ -105,9 +112,16 @@ typedef struct struct_message {
     float r_y;
     float l_x;
     float l_y;
+    bool send_image;
 } struct_message;
 // Create a struct_message to hold incoming sensor readings
 struct_message outgoungControl_instructions;
+
+float last_r_x_sent=0;
+float last_r_y_sent=0;
+float last_l_x_sent=0;
+float last_l_y_sent=0;
+
 
 typedef struct {
   uint8_t type;
@@ -122,12 +136,23 @@ typedef struct tank_struct_message {
 
 typedef struct image_part_message {
     uint8_t type;
-    uint8_t part_number;
-    char *part_buf[64];
+    int part_number;
+    int total_parts;
+    int total_size;
+    uint8_t part_buf[220];
     
 } image_part_message;
 
 tank_struct_message incoming_tank_data;
+
+int width=320;
+int height=480;
+
+uint8_t *fb_ptr;
+uint8_t *last_image;
+bool image_available=false;
+int image_buffer_len=0;
+bool memallocated=false;
 
 esp_now_peer_info_t peerInfo; 
 // Variable to store if sending data was successful
@@ -135,11 +160,12 @@ String success;
 
 // Callback when data is sent
 void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
-  Serial.print("\r\nLast Packet Send Status:\t");
-  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Delivery Success" : "Delivery Fail");
+  //Serial.print("\r\nLast Packet Send Status:\t");
+  //Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Delivery Success" : "Delivery Fail");
   if (status ==0){
     success = "Delivery Success :)";
     connected=true;
+    
   }
   else{
     success = "Delivery Fail :(";
@@ -149,56 +175,71 @@ void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
 }
 
 // Callback when data is received
-void OnDataRecv(const uint8_t * mac, const uint8_t *data, int len) {
-  common_t *common = (common_t*)data;
+void OnDataRecv(const uint8_t * mac, const uint8_t *incommingData, int len) {
+  common_t *common = (common_t*)incommingData;
+  
   if (common->type == TELEMETRY) {
-    tank_struct_message *incoming_tank_data = (tank_struct_message*)data;
-    // Handle message of type A
+    //Serial.println("recevied telemtry packet");
+    //tank_struct_message *incoming_tank_data = (tank_struct_message*)data;
+    // Handle messages that have telemetry data
+    memcpy(&incoming_tank_data, incommingData, sizeof(incoming_tank_data));
+    //Serial.print(incoming_tank_data.ultrasound_distance);
     ultrasound_distance = incoming_tank_data.ultrasound_distance;
     tank_status = String(incoming_tank_data.state);
   } else if (common->type == IMAGE_PART) {
-    image_part_message *incoming_image_part = (image_part_message*)data;
-    // Handle message of type B
+    //Serial.println("recevied image fragment");
     
-  }
+    image_part_message incoming_image_part; 
+    
+    memcpy(&incoming_image_part, incommingData, sizeof(incoming_image_part));
+    
+    // Handle message that contain image fragments
+    //Serial.println("fragment " +String(incoming_image_part.part_number)+ " of " + String(incoming_image_part.total_parts));
+    int start=incoming_image_part.part_number*220;
+    if (incoming_image_part.part_number==0){
+       //Serial.println("allocating memory for incoming image of size " + String(incoming_image_part.total_size));
+       free(fb_ptr);
+       fb_ptr = (uint8_t*)malloc(incoming_image_part.total_size);
+       outgoungControl_instructions.send_image=false;
+       //Serial.println("Memory allocated");
+       
+       
+       memallocated=true;
+    }
+    if (memallocated){
+      //Serial.println("fragement startpoint "+String(start) + " for length " + String(sizeof(incoming_image_part.part_buf)));
+      //uint8_t* buffer = (uint8_t*)heap_caps_malloc(50 * sizeof(uint8_t), MALLOC_CAP_32BIT);
+      memcpy(fb_ptr + start, incoming_image_part.part_buf, sizeof(incoming_image_part.part_buf));
+      //Serial.println("framebuffer now "+ *fb_ptr);
+      if (incoming_image_part.part_number==incoming_image_part.total_parts-1){
+         //Serial.println("Finished receinving image");
+         //for (int i = 0; i < incoming_image_part.total_size; i++){
+         // Serial.print(fb_ptr[i] < 16 ? "0" : "");
+         // Serial.print(fb_ptr[i],HEX);
+         // Serial.print(" ");
+         //}
+         
+         while (image_available){
+           delay(1);
+         }
+         free(last_image);
+         image_buffer_len=incoming_image_part.total_size;
+         last_image = (uint8_t*)malloc(image_buffer_len);
+         memcpy(last_image, fb_ptr, image_buffer_len);
+         image_available=true;
+         outgoungControl_instructions.send_image=true;
+         // uint16_t w = 0, h = 0;
+         //uint16_t w = 0, h = 0;
+         //TJpgDec.getJpgSize(&w, &h, last_image, incoming_image_part.total_size);
+         //Serial.print("Width = "); Serial.print(w); Serial.print(", height = "); Serial.println(h);
   
-  memcpy(&incoming_tank_data, incomingData, sizeof(incoming_tank_data));
-  Serial.print("Bytes received: ");
-  Serial.println(len);
-  if (incoming_tank_data.message_type=TELEMETRY){
-    ultrasound_distance = incoming_tank_data.ultrasound_distance;
-    tank_status = String(incoming_tank_data.state);
+          
+      }
+    }
   }
-  
+      
 }
 
-extern const uint8_t hanzi[];
-void showhanzi(unsigned int x, unsigned int y, unsigned char index)
-{
-    uint8_t i, j, c, first = 1;
-    uint8_t *temp = (uint8_t*)hanzi;
-    uint16_t color;
-    tft.setAddrWindow(x, y, x + 31, y + 31); //设置区域
-    temp += index * 128;
-    for (j = 0; j < 128; j++)
-    {
-        c = pgm_read_byte(temp);
-        for (i = 0; i < 8; i++)
-        {
-            if ((c & (1 << i)) != 0)
-            {
-                color = RED;
-            }
-            else
-            {
-                color = BLACK;
-            }
-            tft.pushColors(&color, 1, first);
-            first = 0;
-        }
-        temp++;
-    }
-}
 
 void setup(void) {
     Serial.begin(115200);
@@ -301,6 +342,9 @@ void printmsg(int row, const char *msg)
 
 void loop(void) {
     tft.fillScreen(BLACK);
+    outgoungControl_instructions.send_image=true;
+    image_buffer_len = 0;
+    image_available=false;
     loop_counter=0;
     tft.setCursor(0, 0);
     tft.setTextColor(GREEN);
@@ -308,10 +352,21 @@ void loop(void) {
     tft.println("right x,y :");
     //static labels
     tft.println("left x,y  :");
-
+    
+    
     while (loop_counter <1000){
       loop_counter=loop_counter+1;
-     
+
+      
+      if (image_available){
+        Serial.println("Drawing image to screen");
+      // Get the width and height in pixels of the jpeg if you wish
+        //TJpgDec.drawJpg(0, 0, last_image, image_buffer_len); // Runs until complete image decoded
+        drawArrayJpeg(last_image, image_buffer_len, 0, 0);
+        image_available=false;
+        outgoungControl_instructions.send_image=true;
+      }
+      
       //read joysticks
       r_x = analogRead(right_x);
       r_y = analogRead(right_y);
@@ -323,6 +378,7 @@ void loop(void) {
       outgoungControl_instructions.r_y = r_x-r_y_offset;
       outgoungControl_instructions.l_x = l_x-l_x_offset;
       outgoungControl_instructions.l_y = l_y-l_y_offset;
+      
       new_text_r = String(outgoungControl_instructions.r_x)+ ", " + String(outgoungControl_instructions.r_y);
       new_text_l = String(outgoungControl_instructions.l_x)+ ", " + String(outgoungControl_instructions.l_y);
       tft.setTextColor(BLACK); //blank previous values
@@ -352,15 +408,24 @@ void loop(void) {
       prev_text_l=new_text_l;
       prev_text_r=new_text_r;
       
-
-      esp_err_t result = esp_now_send(broadcastAddress, (uint8_t *) &outgoungControl_instructions, sizeof(outgoungControl_instructions));
-      if (result == ESP_OK) {
-        Serial.println("Sent with success");
+      
+      if (outgoungControl_instructions.send_image || outgoungControl_instructions.r_x != last_r_x_sent || outgoungControl_instructions.r_y != last_r_y_sent || outgoungControl_instructions.l_x != last_l_x_sent || outgoungControl_instructions.l_y != last_l_y_sent){
+        esp_err_t result = esp_now_send(broadcastAddress, (uint8_t *) &outgoungControl_instructions, sizeof(outgoungControl_instructions));
+        last_r_x_sent=outgoungControl_instructions.r_x;
+        last_r_y_sent=outgoungControl_instructions.r_y;
+        last_l_x_sent=outgoungControl_instructions.l_x;
+        last_l_y_sent=outgoungControl_instructions.l_y;
+        if (result == ESP_OK) {
+          //Serial.println("Sent with success");
+        }
+        else {
+          //Serial.println("Error sending the data");
+          tank_status="offline";
+        }
+        
       }
-      else {
-        Serial.println("Error sending the data");
-        tank_status="offline";
-      }
+      
+      
       if (connected){
         tft.drawCircle(400, 300, 10, GREEN);
       }else{
@@ -370,331 +435,12 @@ void loop(void) {
     }
 }
 
-typedef struct {
-    PGM_P msg;
-    uint32_t ms;
-} TEST;
-TEST result[12];
 
-#define RUNTEST(n, str, test) { result[n].msg = PSTR(str); result[n].ms = test; delay(500); }
-
-void runtests(void)
+bool tft_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap)
 {
-    uint8_t i, len = 24, cnt;
-    uint32_t total;
-    RUNTEST(0, "FillScreen               ", testFillScreen());
-    RUNTEST(1, "Text                     ", testText());
-    RUNTEST(2, "Lines                    ", testLines(CYAN));
-    RUNTEST(3, "Horiz/Vert Lines         ", testFastLines(RED, BLUE));
-    RUNTEST(4, "Rectangles (outline)     ", testRects(GREEN));
-    RUNTEST(5, "Rectangles (filled)      ", testFilledRects(YELLOW, MAGENTA));
-    RUNTEST(6, "Circles (filled)         ", testFilledCircles(10, MAGENTA));
-    RUNTEST(7, "Circles (outline)        ", testCircles(10, WHITE));
-    RUNTEST(8, "Triangles (outline)      ", testTriangles());
-    RUNTEST(9, "Triangles (filled)       ", testFilledTriangles());
-    RUNTEST(10, "Rounded rects (outline)  ", testRoundRects());
-    RUNTEST(11, "Rounded rects (filled)   ", testFilledRoundRects());
-
-    tft.fillScreen(BLACK);
-    tft.setTextColor(GREEN);
-    tft.setCursor(0, 0);
-    uint16_t wid = tft.width();
-    if (wid > 176) {
-        tft.setTextSize(2);
-#if defined(MCUFRIEND_KBV_H_)
-        tft.print("MCUFRIEND ");
-#if MCUFRIEND_KBV_H_ != 0
-        tft.print(0.01 * MCUFRIEND_KBV_H_, 2);
-#else
-        tft.print("for");
-#endif
-        tft.println(" UNO");
-#else
-        tft.println("Adafruit-Style Tests");
-#endif
-    } else len = wid / 6 - 8;
-    tft.setTextSize(1);
-    total = 0;
-    for (i = 0; i < 12; i++) {
-        PGM_P str = result[i].msg;
-        char c;
-        if (len > 24) {
-            if (i < 10) tft.print(" ");
-            tft.print(i);
-            tft.print(": ");
-        }
-        uint8_t cnt = len;
-        while ((c = pgm_read_byte(str++)) && cnt--) tft.print(c);
-        tft.print(" ");
-        tft.println(result[i].ms);
-        total += result[i].ms;
-    }
-    tft.setTextSize(2);
-    tft.print("Total:");
-    tft.print(0.000001 * total);
-    tft.println("sec");
-    g_identifier = tft.readID();
-    tft.print("ID: 0x");
-    tft.println(tft.readID(), HEX);
-//    tft.print("Reg(00):0x");
-//    tft.println(tft.readReg(0x00), HEX);
-    tft.print("F_CPU:");
-    tft.print(0.000001 * F_CPU);
-#if defined(__OPTIMIZE_SIZE__)
-    tft.println("MHz -Os");
-#else
-    tft.println("MHz");
-#endif
-
-    delay(10000);
-}
-
-// Standard Adafruit tests.  will adjust to screen size
-
-unsigned long testFillScreen() {
-    unsigned long start = micros();
-    tft.fillScreen(BLACK);
-    tft.fillScreen(RED);
-    tft.fillScreen(GREEN);
-    tft.fillScreen(BLUE);
-    tft.fillScreen(BLACK);
-    return micros() - start;
-}
-
-unsigned long testText() {
-    unsigned long start;
-    tft.fillScreen(BLACK);
-    start = micros();
-    tft.setCursor(0, 0);
-    tft.setTextColor(WHITE);  tft.setTextSize(1);
-    tft.println("Hello World!");
-    tft.setTextColor(YELLOW); tft.setTextSize(2);
-    tft.println(123.45);
-    tft.setTextColor(RED);    tft.setTextSize(3);
-    tft.println(0xDEADBEEF, HEX);
-    tft.println();
-    tft.setTextColor(GREEN);
-    tft.setTextSize(5);
-    tft.println("Groop");
-    tft.setTextSize(2);
-    tft.println("I implore thee,");
-    tft.setTextSize(1);
-    tft.println("my foonting turlingdromes.");
-    tft.println("And hooptiously drangle me");
-    tft.println("with crinkly bindlewurdles,");
-    tft.println("Or I will rend thee");
-    tft.println("in the gobberwarts");
-    tft.println("with my blurglecruncheon,");
-    tft.println("see if I don't!");
-    return micros() - start;
-}
-
-unsigned long testLines(uint16_t color) {
-    unsigned long start, t;
-    int           x1, y1, x2, y2,
-                  w = tft.width(),
-                  h = tft.height();
-
-    tft.fillScreen(BLACK);
-
-    x1 = y1 = 0;
-    y2    = h - 1;
-    start = micros();
-    for (x2 = 0; x2 < w; x2 += 6) tft.drawLine(x1, y1, x2, y2, color);
-    x2    = w - 1;
-    for (y2 = 0; y2 < h; y2 += 6) tft.drawLine(x1, y1, x2, y2, color);
-    t     = micros() - start; // fillScreen doesn't count against timing
-
-    tft.fillScreen(BLACK);
-
-    x1    = w - 1;
-    y1    = 0;
-    y2    = h - 1;
-    start = micros();
-    for (x2 = 0; x2 < w; x2 += 6) tft.drawLine(x1, y1, x2, y2, color);
-    x2    = 0;
-    for (y2 = 0; y2 < h; y2 += 6) tft.drawLine(x1, y1, x2, y2, color);
-    t    += micros() - start;
-
-    tft.fillScreen(BLACK);
-
-    x1    = 0;
-    y1    = h - 1;
-    y2    = 0;
-    start = micros();
-    for (x2 = 0; x2 < w; x2 += 6) tft.drawLine(x1, y1, x2, y2, color);
-    x2    = w - 1;
-    for (y2 = 0; y2 < h; y2 += 6) tft.drawLine(x1, y1, x2, y2, color);
-    t    += micros() - start;
-
-    tft.fillScreen(BLACK);
-
-    x1    = w - 1;
-    y1    = h - 1;
-    y2    = 0;
-    start = micros();
-    for (x2 = 0; x2 < w; x2 += 6) tft.drawLine(x1, y1, x2, y2, color);
-    x2    = 0;
-    for (y2 = 0; y2 < h; y2 += 6) tft.drawLine(x1, y1, x2, y2, color);
-
-    return micros() - start;
-}
-
-unsigned long testFastLines(uint16_t color1, uint16_t color2) {
-    unsigned long start;
-    int           x, y, w = tft.width(), h = tft.height();
-
-    tft.fillScreen(BLACK);
-    start = micros();
-    for (y = 0; y < h; y += 5) tft.drawFastHLine(0, y, w, color1);
-    for (x = 0; x < w; x += 5) tft.drawFastVLine(x, 0, h, color2);
-
-    return micros() - start;
-}
-
-unsigned long testRects(uint16_t color) {
-    unsigned long start;
-    int           n, i, i2,
-                  cx = tft.width()  / 2,
-                  cy = tft.height() / 2;
-
-    tft.fillScreen(BLACK);
-    n     = min(tft.width(), tft.height());
-    start = micros();
-    for (i = 2; i < n; i += 6) {
-        i2 = i / 2;
-        tft.drawRect(cx - i2, cy - i2, i, i, color);
-    }
-
-    return micros() - start;
-}
-
-unsigned long testFilledRects(uint16_t color1, uint16_t color2) {
-    unsigned long start, t = 0;
-    int           n, i, i2,
-                  cx = tft.width()  / 2 - 1,
-                  cy = tft.height() / 2 - 1;
-
-    tft.fillScreen(BLACK);
-    n = min(tft.width(), tft.height());
-    for (i = n; i > 0; i -= 6) {
-        i2    = i / 2;
-        start = micros();
-        tft.fillRect(cx - i2, cy - i2, i, i, color1);
-        t    += micros() - start;
-        // Outlines are not included in timing results
-        tft.drawRect(cx - i2, cy - i2, i, i, color2);
-    }
-
-    return t;
-}
-
-unsigned long testFilledCircles(uint8_t radius, uint16_t color) {
-    unsigned long start;
-    int x, y, w = tft.width(), h = tft.height(), r2 = radius * 2;
-
-    tft.fillScreen(BLACK);
-    start = micros();
-    for (x = radius; x < w; x += r2) {
-        for (y = radius; y < h; y += r2) {
-            tft.fillCircle(x, y, radius, color);
-        }
-    }
-
-    return micros() - start;
-}
-
-unsigned long testCircles(uint8_t radius, uint16_t color) {
-    unsigned long start;
-    int           x, y, r2 = radius * 2,
-                        w = tft.width()  + radius,
-                        h = tft.height() + radius;
-
-    // Screen is not cleared for this one -- this is
-    // intentional and does not affect the reported time.
-    start = micros();
-    for (x = 0; x < w; x += r2) {
-        for (y = 0; y < h; y += r2) {
-            tft.drawCircle(x, y, radius, color);
-        }
-    }
-
-    return micros() - start;
-}
-
-unsigned long testTriangles() {
-    unsigned long start;
-    int           n, i, cx = tft.width()  / 2 - 1,
-                        cy = tft.height() / 2 - 1;
-
-    tft.fillScreen(BLACK);
-    n     = min(cx, cy);
-    start = micros();
-    for (i = 0; i < n; i += 5) {
-        tft.drawTriangle(
-            cx    , cy - i, // peak
-            cx - i, cy + i, // bottom left
-            cx + i, cy + i, // bottom right
-            tft.color565(0, 0, i));
-    }
-
-    return micros() - start;
-}
-
-unsigned long testFilledTriangles() {
-    unsigned long start, t = 0;
-    int           i, cx = tft.width()  / 2 - 1,
-                     cy = tft.height() / 2 - 1;
-
-    tft.fillScreen(BLACK);
-    start = micros();
-    for (i = min(cx, cy); i > 10; i -= 5) {
-        start = micros();
-        tft.fillTriangle(cx, cy - i, cx - i, cy + i, cx + i, cy + i,
-                         tft.color565(0, i, i));
-        t += micros() - start;
-        tft.drawTriangle(cx, cy - i, cx - i, cy + i, cx + i, cy + i,
-                         tft.color565(i, i, 0));
-    }
-
-    return t;
-}
-
-unsigned long testRoundRects() {
-    unsigned long start;
-    int           w, i, i2, red, step,
-                  cx = tft.width()  / 2 - 1,
-                  cy = tft.height() / 2 - 1;
-
-    tft.fillScreen(BLACK);
-    w     = min(tft.width(), tft.height());
-    start = micros();
-    red = 0;
-    step = (256 * 6) / w;
-    for (i = 0; i < w; i += 6) {
-        i2 = i / 2;
-        red += step;
-        tft.drawRoundRect(cx - i2, cy - i2, i, i, i / 8, tft.color565(red, 0, 0));
-    }
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      
-    return micros() - start;
-}
-
-unsigned long testFilledRoundRects() {
-    unsigned long start;
-    int           i, i2, green, step,
-                  cx = tft.width()  / 2 - 1,
-                  cy = tft.height() / 2 - 1;
-
-    tft.fillScreen(BLACK);
-    start = micros();
-    green = 256;
-    step = (256 * 6) / min(tft.width(), tft.height());
-    for (i = min(tft.width(), tft.height()); i > 20; i -= 6) {
-        i2 = i / 2;
-        green -= step;
-        tft.fillRoundRect(cx - i2, cy - i2, i, i, i / 8, tft.color565(0, green, 0));
-    }
-
-    return micros() - start;
+   // Stop further decoding as image is running off bottom of screen
+  if ( y >= tft.height() ) return 0;
+   tft.drawRGBBitmap(x, y, bitmap, w, h);
+   // Return 1 to decode next block
+   return 1;
 }

@@ -90,10 +90,8 @@ void CameraWebServer_AP::CameraWebServer_AP_Init(void)
     return;
   }
   sensor_t *s = esp_camera_sensor_get();
-  //drop down frame size for higher initial frame rate
-  //s->set_framesize(s, FRAMESIZE_SXGA); //字节长度采样值:60000                 #9 (画质高)  1280x1024
-  s->set_framesize(s, FRAMESIZE_SVGA); //字节长度采样值:40000                   #7 (画质中)  800x600
-  // s->set_framesize(s, FRAMESIZE_QVGA); //字节长度采样值:10000                #4 (画质低)  320x240
+  s->set_framesize(s, FRAMESIZE_HVGA); // 480x320
+  
 
 #if defined(CAMERA_MODEL_M5STACK_WIDE)
   s->set_vflip(s, 0);
@@ -107,27 +105,7 @@ void CameraWebServer_AP::CameraWebServer_AP_Init(void)
 
   Serial.println("\r\n");
 
-  uint64_t chipid = ESP.getEfuseMac();
-  char string[10];
-  sprintf(string, "%04X", (uint16_t)(chipid >> 32));
-  String mac0_default = String(string);
-  sprintf(string, "%08X", (uint32_t)chipid);
-  String mac1_default = String(string);
-  String url = ssid + mac0_default + mac1_default;
-  const char *mac_default = url.c_str();
-
-  Serial.println(":----------------------------:");
-  //Serial.print("wifi_name:");
-  Serial.println(mac_default);
-  Serial.println(":----------------------------:");
-  //wifi_name = mac0_default + mac1_default;
-
-  //WiFi.setTxPower(WIFI_POWER_19_5dBm);
-  //WiFi.mode(WIFI_AP);
-  //WiFi.softAP(mac_default, password, 9);
+ 
   startCameraServer();
 
-  //Serial.print("Camera Ready! Use 'http://");
-  //Serial.print(WiFi.softAPIP());
-  //Serial.println("' to connect");
 }
